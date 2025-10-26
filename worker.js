@@ -1,10 +1,10 @@
-// Cloudflare Worker — CV Maker (Enhanced Experience Handling)
-// Vars:
+// Cloudflare Worker — CV Maker via Workers AI REST API (structured fields + robust JSON)
+// Vars (Worker Settings):
 //   Text Variable:  CF_ACCOUNT_ID
 //   Secret:         CF_API_TOKEN
 const MODEL = "@cf/meta/llama-3-8b-instruct";
 
-// ---------- CORS ----------
+/* ------------------- CORS ------------------- */
 function corsHeadersFor(origin) {
   const ALLOWED = new Set(["https://arrafahvg.github.io"]);
   const allowOrigin = ALLOWED.has(origin) ? origin : "https://arrafahvg.github.io";
@@ -16,37 +16,92 @@ function corsHeadersFor(origin) {
   };
 }
 
-// ---------- Pre-clean and prompt ----------
-function cleanText(raw) {
-  return String(raw || "")
+/* ------------------- Helpers ------------------- */
+function norm(s) { return (s ?? "").toString().trim(); }
+function cleanMultiline(s) {
+  return norm(s)
     .replace(/\r/g, "")
+    .replace(/[•▪·]/g, "-")
     .replace(/\s{2,}/g, " ")
-    .replace(/·/g, "-")
-    .replace(/\+?\d+\s*skills?/gi, "")
-    .replace(/\b(Full-time|Hybrid|Remote|Freelance)\b/gi, "")
-    .replace(/([A-Za-z])\1{2,}/g, "$1") // remove triple repeats
-    .replace(/([A-Z][a-z]+)\s+\1/gi, "$1") // remove doubled words
     .replace(/\n{2,}/g, "\n")
-    .trim();
+    .slice(0, 12000);
 }
 
-function buildPrompt(inputs, lang) {
+function tryParseJSON(s) { try { return JSON.parse(s); } catch { return null; } }
+function stripFences(s) { return (s || "").replace(/```[\s\S]*?```/g, "").trim(); }
+function coerceJson(raw) {
+  if (!raw) return null;
+  let s = stripFences(String(raw).trim());
+
+  // direct
+  let j = tryParseJSON(s);
+  if (j && typeof j === "object") return j;
+
+  // quoted JSON object
+  if (/^"\{/.test(s)) {
+    const inner = tryParseJSON(JSON.parse(s));
+    if (inner && typeof inner === "object") return inner;
+  }
+
+  // unescape common sequences then parse
+  s = s.replace(/\\n/g, "\n").replace(/\\"/g, '"').replace(/\\\\/g, "\\").replace(/,\s*([}\]])/g, "$1");
+  j = tryParseJSON(s);
+  if (j && typeof j === "object") return j;
+
+  // slice outermost block
+  const a = s.indexOf("{"), b = s.lastIndexOf("}");
+  if (a >= 0 && b > a) {
+    const block = s.slice(a, b + 1);
+    const j2 = tryParseJSON(block);
+    if (j2 && typeof j2 === "object") return j2;
+  }
+  return null;
+}
+
+function minimalFallback(fields) {
+  const full_name = [norm(fields.firstName), norm(fields.lastName)].filter(Boolean).join(" ") || "Your Name";
+  return {
+    header: {
+      full_name,
+      title: "",
+      location: [norm(fields.city), norm(fields.province)].filter(Boolean).join(", "),
+      email: norm(fields.email),
+      phone: norm(fields.phone),
+      links: []
+    },
+    summary: norm(fields.summary) || "Professional with experience. Replace this with your achievements.",
+    skills: { core: [], tools: [], languages: [] },
+    experience: [],
+    education: [],
+    certifications: [],
+    extras: []
+  };
+}
+
+/* ------------------- Prompt ------------------- */
+function buildPromptFromFields(fields, lang) {
   const language = lang === "en" ? "English" : "Indonesian";
-  const cleaned = cleanText(inputs);
+
+  const headerBlock = `
+Full Name: ${[norm(fields.firstName), norm(fields.lastName)].filter(Boolean).join(" ")}
+Title (if any): ${norm(fields.title || "")}
+Location: ${[norm(fields.city), norm(fields.province)].filter(Boolean).join(", ")}
+Email: ${norm(fields.email)}
+Phone: ${norm(fields.phone)}
+Links: ${norm(fields.links || "")}
+`.trim();
+
+  const skillsBlock = norm(fields.skills || "");
+  const experienceBlock = cleanMultiline(fields.experience || "");
+  const educationBlock = cleanMultiline(fields.education || "");
+  const summaryBlock = cleanMultiline(fields.summary || "");
+
   return `
-You are an expert CV writer. Rewrite the following raw CV info into a clean, ATS-optimized ${language} resume.
+You are an expert CV writer. Your ONLY output must be ONE valid JSON object (no code fences, no quotes around the object, no markdown).
 
-Focus on:
-- Condensing redundant experience text.
-- Merging repeated job titles or duplicated descriptions.
-- Keeping clear bullet points with measurable impact.
-- Using strong verbs and results.
-- Preserving accurate chronology and company names.
+Language: ${language}.
 
-STRICT RULES:
-- Respond with JSON ONLY (no markdown, no commentary).
-- Follow this schema exactly:
-
+Schema (fill only useful fields):
 {
   "header": { "full_name": "", "title": "", "location": "", "email": "", "phone": "", "links": [] },
   "summary": "",
@@ -65,43 +120,55 @@ STRICT RULES:
   "extras": []
 }
 
-RAW_CV:
-${cleaned}
+Rules:
+- Condense and de-duplicate experience text; use 3–6 strong, results-oriented bullets per role.
+- Use present tense for current roles; past tense for previous roles.
+- No emojis or decorative characters.
+- Output must be a single minified JSON object.
+
+DATA:
+[HEADER]
+${headerBlock}
+
+[SKILLS]
+${skillsBlock}
+
+[EXPERIENCE]
+${experienceBlock}
+
+[EDUCATION]
+${educationBlock}
+
+[SUMMARY]
+${summaryBlock}
 `.trim();
 }
 
-// ---------- JSON helpers ----------
-function tryParseJSON(s) {
-  try { return JSON.parse(s); } catch { return null; }
-}
-function coerceJson(raw) {
-  if (!raw) return null;
-  let s = String(raw).trim().replace(/```[\s\S]*?```/g, "");
-  let p = tryParseJSON(s);
-  if (p && typeof p === "object") return p;
-  if (/^"\{/.test(s)) {
-    const inner = tryParseJSON(JSON.parse(s));
-    if (inner) return inner;
-  }
-  s = s.replace(/\\n/g, "\n").replace(/\\"/g, '"');
-  return tryParseJSON(s);
-}
-function fallback(inputs) {
-  const txt = String(inputs || "");
-  const lines = txt.split(/\r?\n/).filter(Boolean);
-  const full_name = lines[0] || "Your Name";
-  return {
-    header: { full_name, title: "", location: "", email: "", phone: "", links: [] },
-    summary: lines.slice(1, 4).join(" "),
-    skills: { core: [], tools: [], languages: [] },
-    experience: [],
-    education: [],
-    certifications: [],
-    extras: []
-  };
+/* ------------------- CF Workers AI ------------------- */
+async function runModel(env, content) {
+  const url = `https://api.cloudflare.com/client/v4/accounts/${env.CF_ACCOUNT_ID}/ai/run/${MODEL}`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${env.CF_API_TOKEN}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      messages: [
+        { role: "system", content: "Only output one valid JSON object. No explanations, no code fences, no quotes around the object." },
+        { role: "user", content }
+      ],
+      // hint; if ignored, our coerceJson still fixes it
+      response_format: { type: "json_object" },
+      max_tokens: 1400,
+      temperature: 0.2
+    }),
+  });
+  const data = await res.json().catch(() => ({}));
+  return { ok: res.ok, status: res.status, data };
 }
 
-// ---------- Worker ----------
+/* ------------------- Worker ------------------- */
 export default {
   async fetch(request, env) {
     const origin = request.headers.get("Origin") || "";
@@ -113,38 +180,51 @@ export default {
 
     if (request.method === "GET") {
       return new Response(JSON.stringify({ ok: true, model: MODEL }), {
-        headers: { "Content-Type": "application/json", ...cors },
+        headers: { "Content-Type": "application/json", ...cors }
       });
     }
 
     try {
       const { inputs, lang = "id" } = await request.json();
-      const aiUrl = `https://api.cloudflare.com/client/v4/accounts/${env.CF_ACCOUNT_ID}/ai/run/${MODEL}`;
 
-      const body = {
-        messages: [
-          { role: "system", content: "You are a strict JSON-only resume generator." },
-          { role: "user", content: buildPrompt(inputs, lang) }
-        ],
-        max_tokens: 1400,
-        temperature: 0.3,
+      // inputs must be a structured object from the form
+      const fields = {
+        firstName: norm(inputs?.firstName),
+        lastName: norm(inputs?.lastName),
+        email: norm(inputs?.email),
+        phone: norm(inputs?.phone),
+        city: norm(inputs?.city),
+        province: norm(inputs?.province),
+        title: norm(inputs?.title),
+        links: norm(inputs?.links),
+        skills: norm(inputs?.skills),
+        experience: norm(inputs?.experience),
+        education: norm(inputs?.education),
+        summary: norm(inputs?.summary)
       };
 
-      const res = await fetch(aiUrl, {
-        method: "POST",
-        headers: {
-          "Authorization": `Bearer ${env.CF_API_TOKEN}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(body),
-      });
+      const prompt = buildPromptFromFields(fields, lang);
+      const r1 = await runModel(env, prompt);
+      const raw1 = r1.data?.result?.response ?? r1.data?.result ?? "";
+      let json = coerceJson(raw1);
 
-      const data = await res.json().catch(() => ({}));
-      const raw = data?.result?.response ?? data?.result ?? "";
-      const parsed = coerceJson(raw) || fallback(inputs);
+      // 2nd pass reformat if still not JSON
+      if (!json) {
+        const fixPrompt = `
+You will receive a supposed JSON resume but it may be quoted or escaped.
+Return only a SINGLE valid JSON object, minified, matching the schema.
+OUTPUT:
+${(raw1 || "").toString().slice(0, 4000)}
+`.trim();
+        const r2 = await runModel(env, fixPrompt);
+        const raw2 = r2.data?.result?.response ?? r2.data?.result ?? "";
+        json = coerceJson(raw2);
+      }
 
-      return new Response(JSON.stringify(parsed), {
-        headers: { "Content-Type": "application/json", ...cors },
+      if (!json) json = minimalFallback(fields);
+
+      return new Response(JSON.stringify(json), {
+        headers: { "Content-Type": "application/json", ...cors }
       });
 
     } catch (e) {
