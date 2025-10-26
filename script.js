@@ -5,7 +5,7 @@ async function enhanceText(inputText) {
     body: JSON.stringify({ inputs: "Improve this CV text in Bahasa Indonesia: " + inputText })
   });
   const result = await response.json();
-  return result[0]?.generated_text || "Gagal menghasilkan teks";
+  return result[0]?.generated_text || inputText;
 }
 
 document.getElementById('generateBtn').addEventListener('click', async () => {
