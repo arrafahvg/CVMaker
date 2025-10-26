@@ -1,11 +1,11 @@
 async function enhanceText(inputText) {
-  const response = await fetch("https://api-inference.huggingface.co/models/google/flan-t5-base", {
+  const response = await fetch("https://cv-maker.arrafahvega.workers.dev/generate", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ inputs: "Improve this CV text in Bahasa Indonesia: " + inputText })
   });
   const result = await response.json();
-  return result[0]?.generated_text || inputText;
+  return result[0]?.generated_text || "Gagal menghasilkan teks";
 }
 
 document.getElementById('generateBtn').addEventListener('click', async () => {
