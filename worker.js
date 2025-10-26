@@ -1,4 +1,4 @@
-// Cloudflare Worker — CV Maker via Workers AI REST API (structured fields + robust JSON)
+// Cloudflare Worker — CV Maker (structured fields + robust JSON, tuned for speed)
 // Vars in Worker Settings:
 //   Text Variable:  CF_ACCOUNT_ID
 //   Secret:         CF_API_TOKEN
@@ -6,7 +6,7 @@ const MODEL = "@cf/meta/llama-3-8b-instruct";
 
 /* ------------------- CORS ------------------- */
 function corsHeadersFor(origin) {
-  const ALLOWED = new Set(["https://arrafahvg.github.io"]); // your site
+  const ALLOWED = new Set(["https://arrafahvg.github.io"]);
   const allowOrigin = ALLOWED.has(origin) ? origin : "https://arrafahvg.github.io";
   return {
     "Access-Control-Allow-Origin": allowOrigin,
@@ -21,13 +21,19 @@ const norm = (s) => (s ?? "").toString().trim();
 const stripFences = (s) => (s || "").replace(/```[\s\S]*?```/g, "").trim();
 const tryParseJSON = (s) => { try { return JSON.parse(s); } catch { return null; } };
 
-function cleanMultiline(s) {
+// keep inputs modest to reduce model latency
+const LIMIT_EXPERIENCE = 4000;    // was 12000
+const LIMIT_EDUCATION  = 1500;
+const LIMIT_SUMMARY    = 1000;
+const LIMIT_SKILLS     = 800;
+
+function cleanMultiline(s, limit) {
   return norm(s)
     .replace(/\r/g, "")
     .replace(/[•▪·]/g, "-")
     .replace(/\s{2,}/g, " ")
     .replace(/\n{2,}/g, "\n")
-    .slice(0, 12000);
+    .slice(0, limit);
 }
 
 function coerceJson(raw) {
@@ -96,10 +102,10 @@ Phone: ${norm(fields.phone)}
 Links: ${norm(fields.links || "")}
 `.trim();
 
-  const skillsBlock = norm(fields.skills || "");
-  const experienceBlock = cleanMultiline(fields.experience || "");
-  const educationBlock = cleanMultiline(fields.education || "");
-  const summaryBlock = cleanMultiline(fields.summary || "");
+  const skillsBlock     = cleanMultiline(fields.skills || "",     LIMIT_SKILLS);
+  const experienceBlock = cleanMultiline(fields.experience || "", LIMIT_EXPERIENCE);
+  const educationBlock  = cleanMultiline(fields.education || "",  LIMIT_EDUCATION);
+  const summaryBlock    = cleanMultiline(fields.summary || "",    LIMIT_SUMMARY);
 
   return `
 You are an expert CV writer. Your ONLY output must be ONE valid JSON object (no code fences, no quotes around the object, no markdown).
@@ -150,7 +156,7 @@ ${summaryBlock}
 }
 
 /* ------------------- CF Workers AI ------------------- */
-async function runModel(env, content) {
+async function runModel(env, content, { maxTokens = 900, temperature = 0.1 } = {}) {
   const url = `https://api.cloudflare.com/client/v4/accounts/${env.CF_ACCOUNT_ID}/ai/run/${MODEL}`;
   const res = await fetch(url, {
     method: "POST",
@@ -164,8 +170,8 @@ async function runModel(env, content) {
         { role: "user", content }
       ],
       response_format: { type: "json_object" }, // hint; safe if ignored
-      max_tokens: 1400,
-      temperature: 0.2
+      max_tokens: maxTokens,
+      temperature
     }),
   });
   const text = await res.text().catch(() => "");
@@ -184,7 +190,6 @@ export default {
     }
 
     if (request.method === "GET") {
-      // quick health check
       return new Response(JSON.stringify({ ok: true, model: MODEL }), {
         headers: { "Content-Type": "application/json", ...cors }
       });
@@ -218,8 +223,8 @@ export default {
 
       const prompt = buildPromptFromFields(fields, lang);
 
-      // First attempt
-      const r1 = await runModel(env, prompt);
+      // First attempt (fast settings)
+      const r1 = await runModel(env, prompt, { maxTokens: 900, temperature: 0.1 });
       if (!r1.ok) {
         return new Response(JSON.stringify({ error: `Workers AI failed`, detail: r1.data || r1.text }), {
           status: r1.status, headers: { "Content-Type": "application/json", ...cors }
@@ -228,7 +233,7 @@ export default {
       const raw1 = r1.data?.result?.response ?? r1.data?.result ?? r1.text ?? "";
       let json = coerceJson(raw1);
 
-      // Second attempt: ask model to reformat the first output to clean JSON
+      // Second attempt: reformat to clean JSON (also fast settings)
       if (!json) {
         const fixPrompt = `
 You will receive a supposed JSON resume but it may be quoted or escaped.
@@ -236,7 +241,7 @@ Return only a SINGLE valid JSON object, minified, matching the schema.
 OUTPUT:
 ${(raw1 || "").toString().slice(0, 4000)}
 `.trim();
-        const r2 = await runModel(env, fixPrompt);
+        const r2 = await runModel(env, fixPrompt, { maxTokens: 700, temperature: 0.0 });
         const raw2 = r2.data?.result?.response ?? r2.data?.result ?? r2.text ?? "";
         json = coerceJson(raw2);
       }
