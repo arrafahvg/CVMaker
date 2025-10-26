@@ -1,12 +1,11 @@
-// Cloudflare Worker — CV Maker via Workers AI REST API (robust JSON)
+// Cloudflare Worker — CV Maker via Workers AI REST API (robust JSON + retry)
 // Vars (Worker Settings):
-//   Text Variable:  CF_ACCOUNT_ID  (e.g. "9165a339e9b5eb55e7727366085e7f60")
-//   Secret:         CF_API_TOKEN   (Account → Workers AI → Read)
+//   Text Variable:  CF_ACCOUNT_ID
+//   Secret:         CF_API_TOKEN
 const MODEL = "@cf/meta/llama-3-8b-instruct";
 
 // ---------- CORS ----------
 function corsHeadersFor(origin) {
-  // Allow ONLY your GitHub Pages origin
   const ALLOWED = new Set(["https://arrafahvg.github.io"]);
   const allowOrigin = ALLOWED.has(origin) ? origin : "https://arrafahvg.github.io";
   return {
@@ -17,9 +16,10 @@ function corsHeadersFor(origin) {
   };
 }
 
-// ---------- Prompt Builder ----------
+// ---------- Prompt Builders ----------
 function buildPrompt(inputs, lang) {
   const language = lang === "en" ? "English" : "Indonesian";
+  const clean = String(inputs || "").replace(/\r/g, "").trim();
   return `
 You are an expert CV writer. Your ONLY output must be ONE valid JSON object (no code fences, no surrounding quotes, no markdown, no comments).
 
@@ -46,15 +46,27 @@ STYLE:
 - Language: ${language}.
 - Bullet points start with strong verbs; quantify impact where possible.
 - Present tense for current role; past tense for previous roles.
-- No emojis. No decorative characters.
+- No emojis or decorative characters.
 
 RAW_CV:
-${inputs}
+${clean}
 
 REMINDERS:
 - Output a single *minified* JSON object.
 - Do NOT wrap the JSON in quotes or code fences.
 - Do NOT escape quotes.
+`.trim();
+}
+
+function buildReformatPrompt(previousOutput) {
+  // 2nd pass: tell the model to fix formatting and return bare JSON only
+  const sample = String(previousOutput || "").slice(0, 4000);
+  return `
+You will receive a model output that is supposed to be a single JSON object but may contain quotes/escapes/markdown.
+Return a SINGLE valid JSON object only. No code fences. No quotes around the object. No commentary.
+
+OUTPUT_TO_FIX:
+${sample}
 `.trim();
 }
 
@@ -66,18 +78,14 @@ function tryParseJSON(s) {
   try { return { ok: true, val: JSON.parse(s) }; }
   catch (e) { return { ok: false, err: e }; }
 }
-// Force a real JS object from any model output
 function forceJson(raw) {
   if (raw == null) return null;
   let s = String(raw).trim();
-
-  // 0) remove code fences if any
   s = stripCodeFences(s);
 
-  // 1) try direct parse
+  // Try direct
   let p = tryParseJSON(s);
   if (p.ok) {
-    // sometimes the model returns a *string* that itself is JSON
     if (typeof p.val === "string") {
       const p2 = tryParseJSON(p.val);
       if (p2.ok && typeof p2.val === "object") return p2.val;
@@ -85,21 +93,21 @@ function forceJson(raw) {
     if (typeof p.val === "object") return p.val;
   }
 
-  // 2) find the outermost {...} block
+  // Try outermost {...}
   const a = s.indexOf("{");
   const b = s.lastIndexOf("}");
   if (a >= 0 && b > a) {
     let block = s.slice(a, b + 1);
 
-    // 2a) parse block as-is
+    // As-is
     p = tryParseJSON(block);
     if (p.ok) return p.val;
 
-    // 2b) if escaped (\" \\n), unescape then parse
+    // Unescape then parse
     const looksEscaped = /\\\"|\\n|\\\\/.test(block);
     if (looksEscaped) {
       const unescaped = block
-        .replace(/\\\\/g, "\\")   // backslashes first
+        .replace(/\\\\/g, "\\")   // order matters
         .replace(/\\"/g, '"')
         .replace(/\\n/g, "\n")
         .replace(/,\s*([}\]])/g, "$1"); // trailing commas
@@ -108,12 +116,12 @@ function forceJson(raw) {
     }
   }
 
-  // 3) last attempt: strip invisible chars and retry
+  // Clean control chars and retry
   const cleaned = s.replace(/[\u0000-\u001f\u007f\u200b\u200e\u200f]/g, "");
   p = tryParseJSON(cleaned);
   if (p.ok && typeof p.val === "object") return p.val;
 
-  return null; // give up; caller handles fallback
+  return null;
 }
 
 // Minimal server-side fallback (guarantees a JSON payload)
@@ -130,6 +138,21 @@ function minimalFallback(inputs) {
     certifications: [],
     extras: []
   };
+}
+
+// ---------- Call Workers AI ----------
+async function callWorkersAI(env, payload) {
+  const url = `https://api.cloudflare.com/client/v4/accounts/${env.CF_ACCOUNT_ID}/ai/run/${MODEL}`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${env.CF_API_TOKEN}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+  const data = await res.json().catch(() => ({}));
+  return { status: res.status, ok: res.ok, data };
 }
 
 // ---------- Worker ----------
@@ -150,21 +173,15 @@ export default {
         const haveId = !!env.CF_ACCOUNT_ID, haveTok = !!env.CF_API_TOKEN;
         let test = null;
         if (haveId && haveTok) {
-          try {
-            const res = await fetch(`https://api.cloudflare.com/client/v4/accounts/${env.CF_ACCOUNT_ID}/ai/run/${MODEL}`, {
-              method: "POST",
-              headers: { "Authorization": `Bearer ${env.CF_API_TOKEN}`, "Content-Type": "application/json" },
-              body: JSON.stringify({
-                messages: [
-                  { role: "system", content: "Reply with exactly: ok" },
-                  { role: "user", content: "say ok" }
-                ],
-                max_tokens: 8, temperature: 0.2
-              })
-            });
-            const data = await res.json().catch(() => ({}));
-            test = { status: res.status, ok: res.ok, snippet: JSON.stringify(data).slice(0, 160) };
-          } catch (e) { test = { error: String(e?.message || e) }; }
+          const { status, ok, data } = await callWorkersAI(env, {
+            messages: [
+              { role: "system", content: "Reply with exactly: ok" },
+              { role: "user", content: "say ok" }
+            ],
+            max_tokens: 8,
+            temperature: 0.1
+          });
+          test = { status, ok, snippet: JSON.stringify(data).slice(0, 160) };
         }
         return new Response(JSON.stringify({ ok: true, model: MODEL, account_id_present: haveId, token_present: haveTok, test }, null, 2), {
           headers: { "Content-Type": "application/json", ...cors }
@@ -183,36 +200,39 @@ export default {
 
       const { inputs, lang = "id" } = await request.json();
 
-      const aiUrl = `https://api.cloudflare.com/client/v4/accounts/${env.CF_ACCOUNT_ID}/ai/run/${MODEL}`;
-      const body = {
+      // ---- First attempt (full CV prompt) ----
+      let resp1 = await callWorkersAI(env, {
         messages: [
-          { role: "system", content: "Only output one valid JSON object. No explanations, no code fences, do not wrap in quotes." },
+          { role: "system", content: "Only output one valid JSON object. No explanations, code fences, or quotes around the object." },
           { role: "user", content: buildPrompt(inputs, lang) }
         ],
-        // Some models honor it; safe if ignored
-        response_format: { type: "json_object" },
-        max_tokens: 900,
-        temperature: 0.2
-      };
-
-      const res = await fetch(aiUrl, {
-        method: "POST",
-        headers: {
-          "Authorization": `Bearer ${env.CF_API_TOKEN}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(body),
+        response_format: { type: "json_object" }, // hint; ignored if unsupported
+        max_tokens: 1200,
+        temperature: 0.0
       });
 
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        return new Response(JSON.stringify({ error: data || "Workers AI request failed" }), {
-          status: res.status, headers: { "Content-Type": "application/json", ...cors }
+      let raw1 = resp1.data?.result?.response ?? resp1.data?.result ?? "";
+      let parsed = forceJson(raw1);
+
+      // ---- Second attempt (reformat the first output) ----
+      if (!parsed) {
+        const resp2 = await callWorkersAI(env, {
+          messages: [
+            { role: "system", content: "Return a single valid JSON object only. No commentary, no code fences, no quotes around the object." },
+            { role: "user", content: buildReformatPrompt(raw1 || "") }
+          ],
+          response_format: { type: "json_object" },
+          max_tokens: 800,
+          temperature: 0.0
         });
+        const raw2 = resp2.data?.result?.response ?? resp2.data?.result ?? "";
+        parsed = forceJson(raw2);
       }
 
-      const raw = data?.result?.response ?? data?.result ?? "";
-      const parsed = forceJson(raw) || minimalFallback(inputs);
+      // ---- Last resort fallback ----
+      if (!parsed) {
+        parsed = minimalFallback(inputs);
+      }
 
       return new Response(JSON.stringify(parsed), {
         headers: { "Content-Type": "application/json", ...cors }
