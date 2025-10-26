@@ -1,97 +1,144 @@
-// --- Helper to call your Worker robustly ---
-async function enhanceText(inputText, { signal, lang } = {}) {
-  const promptLang = lang === "en" ? "English" : "Bahasa Indonesia";
-  const payload = { inputs: `Improve this CV text in ${promptLang}:\n\n${inputText}` };
-
+async function callAI(combinedText, lang, { signal } = {}) {
   const res = await fetch("https://cv-maker.arrafahvega.workers.dev/generate", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-    signal,
+    body: JSON.stringify({ inputs: combinedText, lang }),
+    signal
   });
-
   if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(`HTTP ${res.status} ${res.statusText} ${text}`);
+    throw new Error(`AI HTTP ${res.status}: ${await res.text().catch(() => "")}`);
   }
-
-  // Accept several common response shapes
-  const data = await res.json();
-  const improved =
-    (Array.isArray(data) && data[0]?.generated_text) ||
-    data.generated_text ||
-    data?.choices?.[0]?.text ||
-    data.text;
-
-  if (!improved || typeof improved !== "string") {
-    throw new Error("Unexpected AI response shape");
-  }
-  return improved.trim();
+  return await res.json(); // should be the JSON schema we requested
 }
 
-// --- Gather all form fields into one clean block of text ---
-function combineFormData(formEl) {
+function getFormText(formEl) {
   const fd = new FormData(formEl);
-  const parts = [];
-  for (const [k, v] of fd.entries()) {
-    const clean = (v || "").toString().trim();
-    if (clean) parts.push(clean);
+  return Array.from(fd.values())
+    .map(v => (v || "").toString().trim())
+    .filter(Boolean)
+    .join("\n");
+}
+
+// Render ATS CV from JSON
+function renderPdfFromJson(json) {
+  const { jsPDF } = window.jspdf;
+  const doc = new jsPDF();
+
+  // Layout settings
+  const left = 10, right = 200 - 10, width = right - left, lineTop = 18;
+
+  // Header
+  doc.setFont("Helvetica", "bold"); doc.setFontSize(18);
+  doc.text(json.header?.full_name || "Name", left, 15);
+  doc.setFont("Helvetica", "normal"); doc.setFontSize(11);
+  const titleLine = [json.header?.title, json.header?.location].filter(Boolean).join(" • ");
+  doc.text(titleLine || "", left, lineTop);
+  const contact = [json.header?.email, json.header?.phone, ...(json.header?.links || [])]
+    .filter(Boolean).join("  |  ");
+  doc.text(contact || "", left, lineTop + 6);
+
+  // Section helper
+  function section(title, y) {
+    doc.setFont("Helvetica", "bold"); doc.setFontSize(13);
+    doc.text(title, left, y);
+    doc.setDrawColor(0); doc.setLineWidth(0.3);
+    doc.line(left, y + 2, right, y + 2);
+    return y + 8;
   }
-  return parts.join("\n");
+
+  let y = lineTop + 16;
+
+  // Summary
+  if (json.summary) {
+    y = section("Professional Summary", y);
+    doc.setFont("Helvetica", "normal"); doc.setFontSize(11);
+    const lines = doc.splitTextToSize(json.summary, width);
+    lines.forEach((ln) => { doc.text(ln, left, y); y += 6; });
+    y += 2;
+  }
+
+  // Skills
+  const allSkills = [
+    ...(json.skills?.core || []),
+    ...(json.skills?.tools || []),
+    ...(json.skills?.languages || [])
+  ];
+  if (allSkills.length) {
+    y = section("Skills", y);
+    const skillLine = allSkills.join(" • ");
+    const lines = doc.splitTextToSize(skillLine, width);
+    lines.forEach((ln) => { doc.text(ln, left, y); y += 6; });
+    y += 2;
+  }
+
+  // Experience
+  if (Array.isArray(json.experience) && json.experience.length) {
+    y = section("Experience", y);
+    json.experience.forEach((xp) => {
+      // role @ company
+      doc.setFont("Helvetica", "bold"); doc.setFontSize(11);
+      const headline = [xp.role, xp.company].filter(Boolean).join(" — ");
+      doc.text(headline, left, y);
+      doc.setFont("Helvetica", "normal");
+      const sub = [xp.location, xp.employment_type, [xp.start_date, xp.end_date].filter(Boolean).join(" – ")].filter(Boolean).join(" • ");
+      y += 6; doc.text(sub, left, y); y += 4;
+
+      // bullets
+      const bullets = (xp.bullets || []).filter(Boolean);
+      bullets.forEach(b => {
+        const wrapped = doc.splitTextToSize(`• ${b}`, width);
+        wrapped.forEach(ln => { y += 6; doc.text(ln, left, y); });
+      });
+      y += 8;
+
+      // page break if near bottom
+      if (y > 275) { doc.addPage(); y = 15; }
+    });
+  }
+
+  // Education
+  if (Array.isArray(json.education) && json.education.length) {
+    y = section("Education", y);
+    json.education.forEach(ed => {
+      doc.setFont("Helvetica", "bold"); doc.setFontSize(11);
+      doc.text([ed.degree, ed.school].filter(Boolean).join(" — "), left, y);
+      doc.setFont("Helvetica", "normal");
+      y += 6; doc.text([ed.location, [ed.start_date, ed.end_date].filter(Boolean).join(" – ")].filter(Boolean).join(" • "), left, y);
+      y += 8;
+      if (y > 275) { doc.addPage(); y = 15; }
+    });
+  }
+
+  // Certifications
+  if (Array.isArray(json.certifications) && json.certifications.length) {
+    y = section("Certifications", y);
+    json.certifications.forEach(c => { doc.text(`• ${c}`, left, y); y += 6; });
+  }
+
+  doc.save("ATS_CV.pdf");
 }
 
 document.getElementById("generateBtn").addEventListener("click", async () => {
   const btn = document.getElementById("generateBtn");
   const form = document.getElementById("cvForm");
-  const lang = document.getElementById("language")?.value || "id";
-  const downloadSection = document.getElementById("downloadSection");
+  const lang = document.getElementById("language")?.value === "en" ? "en" : "id";
+  const original = btn.textContent;
 
-  // UI busy state
-  const originalLabel = btn.textContent;
-  btn.disabled = true;
-  btn.setAttribute("aria-busy", "true");
-  btn.textContent = "Processing...";
-
-  // Build combined text from the form
-  const combinedText = combineFormData(form);
-
-  // Timeout protection (prevents infinite hanging)
+  // Busy UI + timeout
+  btn.disabled = true; btn.textContent = "Processing...";
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort("timeout"), 20000); // 20s
-
-  let finalText = combinedText;
+  const t = setTimeout(() => controller.abort("timeout"), 20000);
 
   try {
-    // Try AI improvement
-    finalText = await enhanceText(combinedText, { signal: controller.signal, lang });
-  } catch (err) {
-    console.error(err);
-    alert("Gagal memproses AI. CV tetap dibuat dari teks asli.");
-    // finalText remains as combinedText
+    const combined = getFormText(form);
+    const json = await callAI(combined, lang, { signal: controller.signal });
+    renderPdfFromJson(json);
+    document.getElementById("downloadSection")?.classList?.remove("hidden");
+  } catch (e) {
+    console.error(e);
+    alert("AI gagal memproses. Periksa koneksi/Server. PDF tidak dibuat.");
   } finally {
-    clearTimeout(timeoutId);
-    // Always restore button
-    btn.disabled = false;
-    btn.removeAttribute("aria-busy");
-    btn.textContent = originalLabel;
+    clearTimeout(t);
+    btn.disabled = false; btn.textContent = original;
   }
-
-  // Create the PDF (works whether AI succeeded or not)
-  const { jsPDF } = window.jspdf;
-  const doc = new jsPDF();
-  doc.setFont("Helvetica", "normal");
-  doc.setFontSize(14);
-  doc.text("Curriculum Vitae (ATS Friendly)", 10, 20);
-  doc.setFontSize(11);
-
-  // Ensure long text wraps inside the page margins
-  doc.text(finalText, 10, 35, { maxWidth: 180 });
-  doc.save("ATS_CV.pdf");
-
-  // Show the download section UI
-  downloadSection?.classList?.remove("hidden");
-});
-
-document.getElementById("downloadCV").addEventListener("click", () => {
-  alert("Your CV has been downloaded!");
 });
