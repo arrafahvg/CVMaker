@@ -1,12 +1,12 @@
 // Cloudflare Worker — CV Maker via Workers AI REST API (structured fields + robust JSON)
-// Vars (Worker Settings):
+// Vars in Worker Settings:
 //   Text Variable:  CF_ACCOUNT_ID
 //   Secret:         CF_API_TOKEN
 const MODEL = "@cf/meta/llama-3-8b-instruct";
 
 /* ------------------- CORS ------------------- */
 function corsHeadersFor(origin) {
-  const ALLOWED = new Set(["https://arrafahvg.github.io"]);
+  const ALLOWED = new Set(["https://arrafahvg.github.io"]); // your site
   const allowOrigin = ALLOWED.has(origin) ? origin : "https://arrafahvg.github.io";
   return {
     "Access-Control-Allow-Origin": allowOrigin,
@@ -17,7 +17,10 @@ function corsHeadersFor(origin) {
 }
 
 /* ------------------- Helpers ------------------- */
-function norm(s) { return (s ?? "").toString().trim(); }
+const norm = (s) => (s ?? "").toString().trim();
+const stripFences = (s) => (s || "").replace(/```[\s\S]*?```/g, "").trim();
+const tryParseJSON = (s) => { try { return JSON.parse(s); } catch { return null; } };
+
 function cleanMultiline(s) {
   return norm(s)
     .replace(/\r/g, "")
@@ -27,8 +30,6 @@ function cleanMultiline(s) {
     .slice(0, 12000);
 }
 
-function tryParseJSON(s) { try { return JSON.parse(s); } catch { return null; } }
-function stripFences(s) { return (s || "").replace(/```[\s\S]*?```/g, "").trim(); }
 function coerceJson(raw) {
   if (!raw) return null;
   let s = stripFences(String(raw).trim());
@@ -43,12 +44,16 @@ function coerceJson(raw) {
     if (inner && typeof inner === "object") return inner;
   }
 
-  // unescape common sequences then parse
-  s = s.replace(/\\n/g, "\n").replace(/\\"/g, '"').replace(/\\\\/g, "\\").replace(/,\s*([}\]])/g, "$1");
+  // unescape then parse
+  s = s
+    .replace(/\\\\/g, "\\")
+    .replace(/\\"/g, '"')
+    .replace(/\\n/g, "\n")
+    .replace(/,\s*([}\]])/g, "$1");
   j = tryParseJSON(s);
   if (j && typeof j === "object") return j;
 
-  // slice outermost block
+  // outermost block
   const a = s.indexOf("{"), b = s.lastIndexOf("}");
   if (a >= 0 && b > a) {
     const block = s.slice(a, b + 1);
@@ -101,7 +106,7 @@ You are an expert CV writer. Your ONLY output must be ONE valid JSON object (no 
 
 Language: ${language}.
 
-Schema (fill only useful fields):
+Schema (fill only useful fields exactly as keys below):
 {
   "header": { "full_name": "", "title": "", "location": "", "email": "", "phone": "", "links": [] },
   "summary": "",
@@ -158,14 +163,14 @@ async function runModel(env, content) {
         { role: "system", content: "Only output one valid JSON object. No explanations, no code fences, no quotes around the object." },
         { role: "user", content }
       ],
-      // hint; if ignored, our coerceJson still fixes it
-      response_format: { type: "json_object" },
+      response_format: { type: "json_object" }, // hint; safe if ignored
       max_tokens: 1400,
       temperature: 0.2
     }),
   });
-  const data = await res.json().catch(() => ({}));
-  return { ok: res.ok, status: res.status, data };
+  const text = await res.text().catch(() => "");
+  let data; try { data = JSON.parse(text); } catch { data = { raw: text }; }
+  return { ok: res.ok, status: res.status, data, text };
 }
 
 /* ------------------- Worker ------------------- */
@@ -179,15 +184,23 @@ export default {
     }
 
     if (request.method === "GET") {
+      // quick health check
       return new Response(JSON.stringify({ ok: true, model: MODEL }), {
         headers: { "Content-Type": "application/json", ...cors }
       });
     }
 
+    // POST /generate
     try {
+      if (!env.CF_ACCOUNT_ID || !env.CF_API_TOKEN) {
+        return new Response(JSON.stringify({ error: "Missing CF_ACCOUNT_ID or CF_API_TOKEN in Worker settings." }), {
+          status: 500, headers: { "Content-Type": "application/json", ...cors }
+        });
+      }
+
       const { inputs, lang = "id" } = await request.json();
 
-      // inputs must be a structured object from the form
+      // Ensure we have the structured fields we expect
       const fields = {
         firstName: norm(inputs?.firstName),
         lastName: norm(inputs?.lastName),
@@ -204,11 +217,18 @@ export default {
       };
 
       const prompt = buildPromptFromFields(fields, lang);
+
+      // First attempt
       const r1 = await runModel(env, prompt);
-      const raw1 = r1.data?.result?.response ?? r1.data?.result ?? "";
+      if (!r1.ok) {
+        return new Response(JSON.stringify({ error: `Workers AI failed`, detail: r1.data || r1.text }), {
+          status: r1.status, headers: { "Content-Type": "application/json", ...cors }
+        });
+      }
+      const raw1 = r1.data?.result?.response ?? r1.data?.result ?? r1.text ?? "";
       let json = coerceJson(raw1);
 
-      // 2nd pass reformat if still not JSON
+      // Second attempt: ask model to reformat the first output to clean JSON
       if (!json) {
         const fixPrompt = `
 You will receive a supposed JSON resume but it may be quoted or escaped.
@@ -217,7 +237,7 @@ OUTPUT:
 ${(raw1 || "").toString().slice(0, 4000)}
 `.trim();
         const r2 = await runModel(env, fixPrompt);
-        const raw2 = r2.data?.result?.response ?? r2.data?.result ?? "";
+        const raw2 = r2.data?.result?.response ?? r2.data?.result ?? r2.text ?? "";
         json = coerceJson(raw2);
       }
 
