@@ -1,16 +1,14 @@
-// FRONTEND — send structured fields to Worker and render the returned JSON
+// FRONTEND — structured fields + longer timeout + clearer errors
 
-// Point this at your Worker:
 const WORKER_URL = "https://cv-maker.arrafahvega.workers.dev/generate";
+const REQUEST_TIMEOUT_MS = 120000; // 120s (was 45s)
 
-// Collect form fields into the structured object the Worker expects
+// Collect form fields the Worker expects
 function getFields() {
   const f = document.getElementById("cvForm");
   const fd = new FormData(f);
   const g = (name) => (fd.get(name) || "").toString().trim();
 
-  // Names must match your HTML input names:
-  // nama_depan, nama_belakang, email, telepon, kota, provinsi, keahlian, pengalaman, pendidikan, profil
   const fields = {
     firstName: g("nama_depan"),
     lastName: g("nama_belakang"),
@@ -18,15 +16,15 @@ function getFields() {
     phone: g("telepon"),
     city: g("kota"),
     province: g("provinsi"),
-    title: "",   // optional; add an input if you want to use it
-    links: "",   // optional
+    title: "",
+    links: "",
     skills: g("keahlian"),
     experience: g("pengalaman"),
     education: g("pendidikan"),
     summary: g("profil")
   };
 
-  console.log("CV payload (inputs):", fields); // helpful to verify
+  console.log("CV payload (inputs):", fields);
   return fields;
 }
 
@@ -41,24 +39,19 @@ async function callAI(fields, lang, { signal } = {}) {
   const text = await res.text().catch(() => "");
 
   if (!res.ok) {
-    // Always show status + response so we see the real error
     throw new Error(`HTTP ${res.status} ${res.statusText}: ${text.slice(0, 800)}`);
   }
 
-  try {
-    return JSON.parse(text);
-  } catch {
-    throw new Error(`Bad JSON from Worker: ${text.slice(0, 800)}`);
-  }
+  try { return JSON.parse(text); }
+  catch { throw new Error(`Bad JSON from Worker: ${text.slice(0, 800)}`); }
 }
 
-// ---------- PDF rendering ----------
+// PDF rendering (same as before)
 function renderPdfFromJson(json) {
   const { jsPDF } = window.jspdf;
   const doc = new jsPDF();
   const left = 10, right = 200 - 10, width = right - left;
 
-  // Header
   doc.setFont("Helvetica", "bold"); doc.setFontSize(18);
   doc.text(json.header?.full_name || "Name", left, 15);
   doc.setFont("Helvetica", "normal"); doc.setFontSize(11);
@@ -139,7 +132,6 @@ function renderPdfFromJson(json) {
   doc.save("ATS_CV.pdf");
 }
 
-// ---------- Button handler ----------
 document.getElementById("generateBtn").addEventListener("click", async () => {
   const btn = document.getElementById("generateBtn");
   const lang = document.getElementById("language")?.value === "en" ? "en" : "id";
@@ -147,7 +139,14 @@ document.getElementById("generateBtn").addEventListener("click", async () => {
 
   btn.disabled = true; btn.textContent = "Processing...";
   const controller = new AbortController();
-  const t = setTimeout(() => controller.abort("timeout"), 45000);
+  const timer = setTimeout(() => controller.abort("timeout"), REQUEST_TIMEOUT_MS);
+
+  // optional progressive status text
+  let dots = 0;
+  const pulse = setInterval(() => {
+    dots = (dots + 1) % 4;
+    btn.textContent = "Processing" + ".".repeat(dots);
+  }, 700);
 
   try {
     const fields = getFields();
@@ -162,7 +161,8 @@ document.getElementById("generateBtn").addEventListener("click", async () => {
       (err && err.name === "AbortError" ? "Request timed out." : "Unknown error");
     alert(`AI gagal memproses.\nDetail: ${msg}`);
   } finally {
-    clearTimeout(t);
+    clearTimeout(timer);
+    clearInterval(pulse);
     btn.disabled = false; btn.textContent = original;
   }
 });
