@@ -1,10 +1,13 @@
 function getFormText(formEl) {
   const fd = new FormData(formEl);
-  return Array.from(fd.values()).map(v => (v || "").toString().trim()).filter(Boolean).join("\n");
+  return Array.from(fd.values())
+    .map(v => (v || "").toString().trim())
+    .filter(Boolean)
+    .join("\n");
 }
 
 async function callAI(combinedText, lang, { signal } = {}) {
-  // ✅ absolute, HTTPS
+  // Point this at your Worker URL (Workers AI REST behind it)
   const WORKER_URL = "https://cv-maker.arrafahvega.workers.dev/generate";
 
   const res = await fetch(WORKER_URL, {
@@ -14,15 +17,17 @@ async function callAI(combinedText, lang, { signal } = {}) {
     signal
   });
 
-  if (!res.ok) throw new Error(`AI HTTP ${res.status}: ${await res.text()}`);
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`AI HTTP ${res.status}: ${text || res.statusText}`);
+  }
   return await res.json();
 }
 
-// Very simple fallback formatter if AI fails
+// Fallback JSON if AI fails
 function fallbackJson(combinedText) {
   const lines = combinedText.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
   const header = { full_name: lines[0] || "Your Name", title: "", location: "", email: "", phone: "", links: [] };
-  // naive grouping
   const summary = lines.slice(1, 6).join(" ");
   const rest = lines.slice(6);
   const bullets = rest.slice(0, 6).map(s => s.replace(/^[-•]\s*/, ""));
@@ -126,7 +131,7 @@ document.getElementById("generateBtn").addEventListener("click", async () => {
 
   btn.disabled = true; btn.textContent = "Processing...";
   const controller = new AbortController();
-  const t = setTimeout(() => controller.abort("timeout"), 20000);
+  const t = setTimeout(() => controller.abort("timeout"), 45000); // ← increased timeout
 
   const combined = getFormText(form);
 
@@ -136,7 +141,6 @@ document.getElementById("generateBtn").addEventListener("click", async () => {
       json = await callAI(combined, lang, { signal: controller.signal });
     } catch (aiErr) {
       console.error(aiErr);
-      // Show exact server error, but STILL produce a PDF using fallback
       alert(`AI gagal memproses.\nDetail: ${aiErr.message.slice(0, 300)}`);
       json = fallbackJson(combined);
     }
