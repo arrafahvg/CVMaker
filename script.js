@@ -4,16 +4,18 @@ function getFormText(formEl) {
 }
 
 async function callAI(combinedText, lang, { signal } = {}) {
-  const res = await fetch("https://cv-maker.arrafahvega.workers.dev/generate", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ inputs: combinedText, lang }),
-    signal
-  });
-  const text = await res.text();
-  if (!res.ok) throw new Error(text || `HTTP ${res.status}`);
-  return JSON.parse(text);
-}
+// ✅ use your real Worker URL
+const WORKER_URL = "https://cv-maker.arrafahvega.workers.dev/generate";
+
+const res = await fetch(WORKER_URL, {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({ inputs: combinedText, lang }),
+  signal
+});
+
+if (!res.ok) throw new Error(`AI HTTP ${res.status}: ${await res.text()}`);
+return await res.json();
 
 // Very simple fallback formatter if AI fails
 function fallbackJson(combinedText) {
