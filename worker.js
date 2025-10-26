@@ -1,12 +1,12 @@
 // Cloudflare Worker — CV Maker via Workers AI REST API (robust JSON)
-// Requires:
-//   CF_ACCOUNT_ID  (Text)
-//   CF_API_TOKEN   (Secret, Account → Workers AI → Read)
-
+// Vars (Worker Settings):
+//   Text Variable:  CF_ACCOUNT_ID  (e.g. "9165a339e9b5eb55e7727366085e7f60")
+//   Secret:         CF_API_TOKEN   (Account → Workers AI → Read)
 const MODEL = "@cf/meta/llama-3-8b-instruct";
 
 // ---------- CORS ----------
 function corsHeadersFor(origin) {
+  // Allow ONLY your GitHub Pages origin
   const ALLOWED = new Set(["https://arrafahvg.github.io"]);
   const allowOrigin = ALLOWED.has(origin) ? origin : "https://arrafahvg.github.io";
   return {
@@ -42,9 +42,9 @@ SCHEMA (fill only useful fields):
   "extras": []
 }
 
-STYLE GUIDELINES:
+STYLE:
 - Language: ${language}.
-- Bullet points start with strong verbs, quantify impact where possible.
+- Bullet points start with strong verbs; quantify impact where possible.
 - Present tense for current role; past tense for previous roles.
 - No emojis. No decorative characters.
 
@@ -52,7 +52,7 @@ RAW_CV:
 ${inputs}
 
 REMINDERS:
-- Output must be a single, minified JSON object.
+- Output a single *minified* JSON object.
 - Do NOT wrap the JSON in quotes or code fences.
 - Do NOT escape quotes.
 `.trim();
@@ -62,46 +62,74 @@ REMINDERS:
 function stripCodeFences(s) {
   return String(s).replace(/```[\s\S]*?```/g, "").trim();
 }
-function extractJsonString(raw) {
-  const stripped = stripCodeFences(raw);
-  const a = stripped.indexOf("{");
-  const b = stripped.lastIndexOf("}");
-  return (a >= 0 && b > a) ? stripped.slice(a, b + 1) : stripped;
-}
-function tryParse(s) {
-  try { return { ok: true, value: JSON.parse(s) }; }
+function tryParseJSON(s) {
+  try { return { ok: true, val: JSON.parse(s) }; }
   catch (e) { return { ok: false, err: e }; }
 }
-// Heuristic repair for common LLM formatting issues
-function coerceJson(raw) {
-  // 1) try direct
-  let jsonStr = extractJsonString(raw);
-  let p = tryParse(jsonStr);
-  if (p.ok) return p.value;
+// Force a real JS object from any model output
+function forceJson(raw) {
+  if (raw == null) return null;
+  let s = String(raw).trim();
 
-  // 2) if the extracted block itself is a quoted JSON string, parse twice
-  // e.g. "{\"header\":{\"full_name\":\"...\"}}"
-  const q = tryParse(jsonStr);
-  if (!q.ok && /^"\{[\s\S]*\}"$/.test(jsonStr)) {
-    const inner = JSON.parse(jsonStr);         // remove outer quotes
-    const p2 = tryParse(inner); if (p2.ok) return p2.value;
+  // 0) remove code fences if any
+  s = stripCodeFences(s);
+
+  // 1) try direct parse
+  let p = tryParseJSON(s);
+  if (p.ok) {
+    // sometimes the model returns a *string* that itself is JSON
+    if (typeof p.val === "string") {
+      const p2 = tryParseJSON(p.val);
+      if (p2.ok && typeof p2.val === "object") return p2.val;
+    }
+    if (typeof p.val === "object") return p.val;
   }
 
-  // 3) unescape common sequences then retry
-  const unescaped = jsonStr
-    .replace(/\\n/g, "\n")
-    .replace(/\\"/g, '"')
-    .replace(/,\s*([}\]])/g, "$1"); // trailing commas
-  const p3 = tryParse(unescaped);
-  if (p3.ok) return p3.value;
+  // 2) find the outermost {...} block
+  const a = s.indexOf("{");
+  const b = s.lastIndexOf("}");
+  if (a >= 0 && b > a) {
+    let block = s.slice(a, b + 1);
 
-  // 4) last attempt: remove invisible chars and retry
-  const cleaned = unescaped.replace(/[\u0000-\u001f\u007f\u200b\u200e\u200f]/g, "");
-  const p4 = tryParse(cleaned);
-  if (p4.ok) return p4.value;
+    // 2a) parse block as-is
+    p = tryParseJSON(block);
+    if (p.ok) return p.val;
 
-  // give up: return null so caller can raise a helpful error
-  return null;
+    // 2b) if escaped (\" \\n), unescape then parse
+    const looksEscaped = /\\\"|\\n|\\\\/.test(block);
+    if (looksEscaped) {
+      const unescaped = block
+        .replace(/\\\\/g, "\\")   // backslashes first
+        .replace(/\\"/g, '"')
+        .replace(/\\n/g, "\n")
+        .replace(/,\s*([}\]])/g, "$1"); // trailing commas
+      const p3 = tryParseJSON(unescaped);
+      if (p3.ok) return p3.val;
+    }
+  }
+
+  // 3) last attempt: strip invisible chars and retry
+  const cleaned = s.replace(/[\u0000-\u001f\u007f\u200b\u200e\u200f]/g, "");
+  p = tryParseJSON(cleaned);
+  if (p.ok && typeof p.val === "object") return p.val;
+
+  return null; // give up; caller handles fallback
+}
+
+// Minimal server-side fallback (guarantees a JSON payload)
+function minimalFallback(inputs) {
+  const txt = String(inputs || "");
+  const lines = txt.split(/\r?\n/).map(t => t.trim()).filter(Boolean);
+  const full_name = lines[0] || "Your Name";
+  return {
+    header: { full_name, title: "", location: "", email: "", phone: "", links: [] },
+    summary: lines.slice(1, 4).join(" "),
+    skills: { core: [], tools: [], languages: [] },
+    experience: [],
+    education: [],
+    certifications: [],
+    extras: []
+  };
 }
 
 // ---------- Worker ----------
@@ -110,11 +138,12 @@ export default {
     const origin = request.headers.get("Origin") || "";
     const cors = corsHeadersFor(origin);
 
+    // Preflight
     if (request.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: { ...cors, "Access-Control-Max-Age": "86400" } });
     }
 
-    // Debug route
+    // Debug
     if (request.method === "GET") {
       const url = new URL(request.url);
       if (url.searchParams.get("debug") === "1") {
@@ -157,10 +186,10 @@ export default {
       const aiUrl = `https://api.cloudflare.com/client/v4/accounts/${env.CF_ACCOUNT_ID}/ai/run/${MODEL}`;
       const body = {
         messages: [
-          { role: "system", content: "Only output one valid JSON object. No explanations or code fences." },
+          { role: "system", content: "Only output one valid JSON object. No explanations, no code fences, do not wrap in quotes." },
           { role: "user", content: buildPrompt(inputs, lang) }
         ],
-        // Some models honor this OpenAI-style hint:
+        // Some models honor it; safe if ignored
         response_format: { type: "json_object" },
         max_tokens: 900,
         temperature: 0.2
@@ -183,17 +212,9 @@ export default {
       }
 
       const raw = data?.result?.response ?? data?.result ?? "";
-      const repaired = coerceJson(raw);
+      const parsed = forceJson(raw) || minimalFallback(inputs);
 
-      if (!repaired) {
-        // send helpful preview so UI can show details
-        return new Response(JSON.stringify({
-          error: "Model did not return valid JSON.",
-          preview: String(raw).slice(0, 1000)
-        }), { status: 502, headers: { "Content-Type": "application/json", ...cors } });
-      }
-
-      return new Response(JSON.stringify(repaired), {
+      return new Response(JSON.stringify(parsed), {
         headers: { "Content-Type": "application/json", ...cors }
       });
 
