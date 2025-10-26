@@ -1,3 +1,8 @@
+function getFormText(formEl) {
+  const fd = new FormData(formEl);
+  return Array.from(fd.values()).map(v => (v || "").toString().trim()).filter(Boolean).join("\n");
+}
+
 async function callAI(combinedText, lang, { signal } = {}) {
   const res = await fetch("https://cv-maker.arrafahvega.workers.dev/generate", {
     method: "POST",
@@ -5,39 +10,49 @@ async function callAI(combinedText, lang, { signal } = {}) {
     body: JSON.stringify({ inputs: combinedText, lang }),
     signal
   });
-  if (!res.ok) {
-    throw new Error(`AI HTTP ${res.status}: ${await res.text().catch(() => "")}`);
-  }
-  return await res.json(); // should be the JSON schema we requested
+  const text = await res.text();
+  if (!res.ok) throw new Error(text || `HTTP ${res.status}`);
+  return JSON.parse(text);
 }
 
-function getFormText(formEl) {
-  const fd = new FormData(formEl);
-  return Array.from(fd.values())
-    .map(v => (v || "").toString().trim())
-    .filter(Boolean)
-    .join("\n");
+// Very simple fallback formatter if AI fails
+function fallbackJson(combinedText) {
+  const lines = combinedText.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+  const header = { full_name: lines[0] || "Your Name", title: "", location: "", email: "", phone: "", links: [] };
+  // naive grouping
+  const summary = lines.slice(1, 6).join(" ");
+  const rest = lines.slice(6);
+  const bullets = rest.slice(0, 6).map(s => s.replace(/^[-•]\s*/, ""));
+
+  return {
+    header,
+    summary: summary || "Professional with experience in the field. Replace this summary with your achievements.",
+    skills: { core: [], tools: [], languages: [] },
+    experience: bullets.length ? [{
+      company: "", role: "", location: "", employment_type: "",
+      start_date: "", end_date: "Present",
+      bullets
+    }] : [],
+    education: [],
+    certifications: [],
+    extras: []
+  };
 }
 
-// Render ATS CV from JSON
 function renderPdfFromJson(json) {
   const { jsPDF } = window.jspdf;
   const doc = new jsPDF();
-
-  // Layout settings
-  const left = 10, right = 200 - 10, width = right - left, lineTop = 18;
+  const left = 10, right = 200 - 10, width = right - left;
 
   // Header
   doc.setFont("Helvetica", "bold"); doc.setFontSize(18);
   doc.text(json.header?.full_name || "Name", left, 15);
   doc.setFont("Helvetica", "normal"); doc.setFontSize(11);
   const titleLine = [json.header?.title, json.header?.location].filter(Boolean).join(" • ");
-  doc.text(titleLine || "", left, lineTop);
-  const contact = [json.header?.email, json.header?.phone, ...(json.header?.links || [])]
-    .filter(Boolean).join("  |  ");
-  doc.text(contact || "", left, lineTop + 6);
+  if (titleLine) doc.text(titleLine, left, 21);
+  const contact = [json.header?.email, json.header?.phone, ...(json.header?.links || [])].filter(Boolean).join("  |  ");
+  if (contact) doc.text(contact, left, 27);
 
-  // Section helper
   function section(title, y) {
     doc.setFont("Helvetica", "bold"); doc.setFontSize(13);
     doc.text(title, left, y);
@@ -46,57 +61,40 @@ function renderPdfFromJson(json) {
     return y + 8;
   }
 
-  let y = lineTop + 16;
+  let y = 35;
 
-  // Summary
   if (json.summary) {
     y = section("Professional Summary", y);
     doc.setFont("Helvetica", "normal"); doc.setFontSize(11);
-    const lines = doc.splitTextToSize(json.summary, width);
-    lines.forEach((ln) => { doc.text(ln, left, y); y += 6; });
+    doc.splitTextToSize(json.summary, width).forEach((ln) => { doc.text(ln, left, y); y += 6; });
     y += 2;
   }
 
-  // Skills
-  const allSkills = [
-    ...(json.skills?.core || []),
-    ...(json.skills?.tools || []),
-    ...(json.skills?.languages || [])
-  ];
+  const allSkills = [...(json.skills?.core || []), ...(json.skills?.tools || []), ...(json.skills?.languages || [])];
   if (allSkills.length) {
     y = section("Skills", y);
-    const skillLine = allSkills.join(" • ");
-    const lines = doc.splitTextToSize(skillLine, width);
-    lines.forEach((ln) => { doc.text(ln, left, y); y += 6; });
+    doc.splitTextToSize(allSkills.join(" • "), width).forEach((ln) => { doc.text(ln, left, y); y += 6; });
     y += 2;
   }
 
-  // Experience
   if (Array.isArray(json.experience) && json.experience.length) {
     y = section("Experience", y);
     json.experience.forEach((xp) => {
-      // role @ company
       doc.setFont("Helvetica", "bold"); doc.setFontSize(11);
-      const headline = [xp.role, xp.company].filter(Boolean).join(" — ");
+      const headline = [xp.role, xp.company].filter(Boolean).join(" — ") || "Experience";
       doc.text(headline, left, y);
       doc.setFont("Helvetica", "normal");
       const sub = [xp.location, xp.employment_type, [xp.start_date, xp.end_date].filter(Boolean).join(" – ")].filter(Boolean).join(" • ");
-      y += 6; doc.text(sub, left, y); y += 4;
+      y += 6; if (sub) doc.text(sub, left, y); y += 2;
 
-      // bullets
-      const bullets = (xp.bullets || []).filter(Boolean);
-      bullets.forEach(b => {
-        const wrapped = doc.splitTextToSize(`• ${b}`, width);
-        wrapped.forEach(ln => { y += 6; doc.text(ln, left, y); });
+      (xp.bullets || []).filter(Boolean).forEach(b => {
+        doc.splitTextToSize(`• ${b}`, width).forEach(ln => { y += 6; doc.text(ln, left, y); });
       });
       y += 8;
-
-      // page break if near bottom
       if (y > 275) { doc.addPage(); y = 15; }
     });
   }
 
-  // Education
   if (Array.isArray(json.education) && json.education.length) {
     y = section("Education", y);
     json.education.forEach(ed => {
@@ -109,7 +107,6 @@ function renderPdfFromJson(json) {
     });
   }
 
-  // Certifications
   if (Array.isArray(json.certifications) && json.certifications.length) {
     y = section("Certifications", y);
     json.certifications.forEach(c => { doc.text(`• ${c}`, left, y); y += 6; });
@@ -124,19 +121,24 @@ document.getElementById("generateBtn").addEventListener("click", async () => {
   const lang = document.getElementById("language")?.value === "en" ? "en" : "id";
   const original = btn.textContent;
 
-  // Busy UI + timeout
   btn.disabled = true; btn.textContent = "Processing...";
   const controller = new AbortController();
   const t = setTimeout(() => controller.abort("timeout"), 20000);
 
+  const combined = getFormText(form);
+
   try {
-    const combined = getFormText(form);
-    const json = await callAI(combined, lang, { signal: controller.signal });
+    let json;
+    try {
+      json = await callAI(combined, lang, { signal: controller.signal });
+    } catch (aiErr) {
+      console.error(aiErr);
+      // Show exact server error, but STILL produce a PDF using fallback
+      alert(`AI gagal memproses.\nDetail: ${aiErr.message.slice(0, 300)}`);
+      json = fallbackJson(combined);
+    }
     renderPdfFromJson(json);
     document.getElementById("downloadSection")?.classList?.remove("hidden");
-  } catch (e) {
-    console.error(e);
-    alert("AI gagal memproses. Periksa koneksi/Server. PDF tidak dibuat.");
   } finally {
     clearTimeout(t);
     btn.disabled = false; btn.textContent = original;
